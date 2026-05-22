@@ -1,0 +1,347 @@
+name: XAUUSD TWO YEAR AUTO RESUME
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  download-month:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    continue-on-error: true
+
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        year: ["2019", "2020", "2021", "2022"]
+        month: ["01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12"]
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install requests
+        run: pip install requests
+
+      - name: Check repo range and old checkpoint
+        id: check
+        env:
+          REPO_NAME: ${{ github.event.repository.name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          YEAR: ${{ matrix.year }}
+          MONTH: ${{ matrix.month }}
+        run: |
+          python - << 'PY'
+          import os, re, requests
+
+          repo_name = os.environ["REPO_NAME"]
+          repo = os.environ["GH_REPO"]
+          token = os.environ["GH_TOKEN"]
+          year = int(os.environ["YEAR"])
+          month = os.environ["MONTH"]
+
+          years = [int(x) for x in re.findall(r"20\d{2}", repo_name)]
+
+          if len(years) < 2:
+              raise Exception("Repo name ভুল। Example: xauusd-team-a-2019-2020")
+
+          start_year = years[-2]
+          end_year = years[-1]
+
+          artifact_name = f"MONTH_XAUUSD_{year}_{month}"
+          skip = False
+          reason = ""
+
+          if year < start_year or year > end_year:
+              skip = True
+              reason = f"{year}_{month} এই repo range-এর বাইরে।"
+          else:
+              headers = {
+                  "Authorization": f"Bearer {token}",
+                  "Accept": "application/vnd.github+json"
+              }
+
+              found = False
+              page = 1
+
+              while True:
+                  url = f"https://api.github.com/repos/{repo}/actions/artifacts?per_page=100&page={page}"
+                  r = requests.get(url, headers=headers, timeout=60)
+                  r.raise_for_status()
+                  data = r.json()
+
+                  for a in data.get("artifacts", []):
+                      if a.get("name") == artifact_name and not a.get("expired", False):
+                          found = True
+                          break
+
+                  if found:
+                      break
+
+                  if len(data.get("artifacts", [])) < 100:
+                      break
+
+                  page += 1
+
+              if found:
+                  skip = True
+                  reason = f"{artifact_name} আগেই complete আছে, তাই skip।"
+              else:
+                  reason = f"{artifact_name} download হবে।"
+
+          print(reason)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"skip={'true' if skip else 'false'}\n")
+              f.write(f"artifact_name={artifact_name}\n")
+          PY
+
+      - name: Download one month
+        if: steps.check.outputs.skip != 'true'
+        env:
+          YEAR: ${{ matrix.year }}
+          MONTH: ${{ matrix.month }}
+        run: |
+          python - << 'PY'
+          import os
+          import csv
+          import lzma
+          import struct
+          import zipfile
+          import calendar
+          import time
+          from datetime import datetime, timedelta
+          import requests
+
+          SYMBOL = "XAUUSD"
+          YEAR = int(os.environ["YEAR"])
+          MONTH = int(os.environ["MONTH"])
+          PRICE_DIVISOR = 1000.0
+
+          os.makedirs("work", exist_ok=True)
+          os.makedirs("output", exist_ok=True)
+
+          tag = f"{YEAR}_{MONTH:02d}"
+          csv_path = f"work/{SYMBOL}_TICK_{tag}_DUKASCOPY.csv"
+          zip_path = f"output/{SYMBOL}_TICK_{tag}_DUKASCOPY.zip"
+
+          def dukascopy_url(year, month, day, hour):
+              return f"https://datafeed.dukascopy.com/datafeed/{SYMBOL}/{year}/{month-1:02d}/{day:02d}/{hour:02d}h_ticks.bi5"
+
+          def download_hour(year, month, day, hour, retries=5):
+              url = dukascopy_url(year, month, day, hour)
+
+              for attempt in range(retries):
+                  try:
+                      r = requests.get(url, timeout=60)
+
+                      if r.status_code != 200 or len(r.content) == 0:
+                          return []
+
+                      raw = lzma.decompress(r.content)
+                      rows = []
+                      base_time = datetime(year, month, day, hour)
+
+                      for i in range(0, len(raw), 20):
+                          chunk = raw[i:i+20]
+
+                          if len(chunk) < 20:
+                              continue
+
+                          ms, ask_i, bid_i, ask_vol, bid_vol = struct.unpack(">IIIff", chunk)
+
+                          t = base_time + timedelta(milliseconds=ms)
+                          ask = ask_i / PRICE_DIVISOR
+                          bid = bid_i / PRICE_DIVISOR
+
+                          rows.append([
+                              t.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+                              bid,
+                              ask,
+                              bid_vol,
+                              ask_vol
+                          ])
+
+                      return rows
+
+                  except Exception as e:
+                      print(f"Retry {attempt+1}/{retries} failed: {url} | {e}", flush=True)
+                      time.sleep(5)
+
+              return []
+
+          days = calendar.monthrange(YEAR, MONTH)[1]
+          total_ticks = 0
+
+          print("=" * 70)
+          print(f"START MONTH: {tag}")
+          print("=" * 70, flush=True)
+
+          with open(csv_path, "w", newline="") as f:
+              writer = csv.writer(f)
+              writer.writerow(["time", "bid", "ask", "bid_volume", "ask_volume"])
+
+              for day in range(1, days + 1):
+                  day_ticks = 0
+
+                  for hour in range(24):
+                      rows = download_hour(YEAR, MONTH, day, hour)
+
+                      if rows:
+                          writer.writerows(rows)
+                          day_ticks += len(rows)
+                          total_ticks += len(rows)
+
+                  print(f"Day {day:02d}/{days} — ticks: {day_ticks:,}", flush=True)
+
+          with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+              z.write(csv_path, arcname=os.path.basename(csv_path))
+
+          size_mb = os.path.getsize(zip_path) / 1024 / 1024
+
+          print(f"MONTH COMPLETE: {tag} — total ticks: {total_ticks:,}", flush=True)
+          print(f"ZIP READY: {zip_path} — {size_mb:.2f} MB", flush=True)
+          PY
+
+      - name: Upload monthly checkpoint
+        if: steps.check.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: MONTH_XAUUSD_${{ matrix.year }}_${{ matrix.month }}
+          path: output/*.zip
+          retention-days: 7
+          compression-level: 0
+
+  combine-final:
+    needs: download-month
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install requests
+        run: pip install requests
+
+      - name: Download all monthly checkpoints and build final folder
+        env:
+          REPO_NAME: ${{ github.event.repository.name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python - << 'PY'
+          import os
+          import re
+          import io
+          import zipfile
+          import shutil
+          import requests
+
+          repo_name = os.environ["REPO_NAME"]
+          repo = os.environ["GH_REPO"]
+          token = os.environ["GH_TOKEN"]
+
+          years = [int(x) for x in re.findall(r"20\d{2}", repo_name)]
+
+          if len(years) < 2:
+              raise Exception("Repo name ভুল। Example: xauusd-team-a-2019-2020")
+
+          start_year = years[-2]
+          end_year = years[-1]
+
+          needed = []
+          for y in range(start_year, end_year + 1):
+              for m in range(1, 13):
+                  needed.append(f"MONTH_XAUUSD_{y}_{m:02d}")
+
+          headers = {
+              "Authorization": f"Bearer {token}",
+              "Accept": "application/vnd.github+json"
+          }
+
+          artifacts = {}
+          page = 1
+
+          while True:
+              url = f"https://api.github.com/repos/{repo}/actions/artifacts?per_page=100&page={page}"
+              r = requests.get(url, headers=headers, timeout=60)
+              r.raise_for_status()
+              data = r.json()
+
+              for a in data.get("artifacts", []):
+                  name = a.get("name")
+                  if name in needed and not a.get("expired", False) and name not in artifacts:
+                      artifacts[name] = a
+
+              if len(data.get("artifacts", [])) < 100:
+                  break
+
+              page += 1
+
+          missing = [x for x in needed if x not in artifacts]
+
+          print(f"Need: {len(needed)} monthly files")
+          print(f"Found: {len(artifacts)} monthly artifacts")
+
+          if missing:
+              print("Missing monthly artifacts:")
+              for x in missing:
+                  print(x)
+              raise Exception("সব month complete হয়নি। আবার Run workflow চাপলে missing গুলো download হবে।")
+
+          os.makedirs("final", exist_ok=True)
+
+          for name in needed:
+              a = artifacts[name]
+              print(f"Downloading artifact: {name}", flush=True)
+
+              r = requests.get(a["archive_download_url"], headers=headers, timeout=120)
+              r.raise_for_status()
+
+              outer = zipfile.ZipFile(io.BytesIO(r.content))
+
+              temp_dir = f"temp_{name}"
+              os.makedirs(temp_dir, exist_ok=True)
+              outer.extractall(temp_dir)
+
+              copied = 0
+              for root, dirs, files in os.walk(temp_dir):
+                  for file in files:
+                      if file.endswith(".zip"):
+                          src = os.path.join(root, file)
+                          dst = os.path.join("final", file)
+                          shutil.copy2(src, dst)
+                          copied += 1
+
+              shutil.rmtree(temp_dir, ignore_errors=True)
+
+              if copied == 0:
+                  raise Exception(f"{name} artifact-এর ভিতরে ZIP পাওয়া যায়নি।")
+
+          final_count = len([x for x in os.listdir("final") if x.endswith(".zip")])
+          print(f"Final ZIP count: {final_count}")
+
+          if final_count != len(needed):
+              raise Exception(f"Expected {len(needed)} final ZIP files, got {final_count}")
+
+          print("FINAL READY", flush=True)
+          PY
+
+      - name: Upload final one-click artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DOWNLOAD_XAUUSD_${{ github.event.repository.name }}
+          path: final/*.zip
+          retention-days: 7
+          compression-level: 0
